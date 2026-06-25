@@ -1,219 +1,301 @@
-# Technical Design: Redis Cache
+# TÀI LIỆU ĐỀ XUẤT KỸ THUẬT — HỆ THỐNG NOTIFICATION (PPC TOOL)
+
+> Trạng thái: Draft · Áp dụng: PPC-BE (Golang, GORM, PostgreSQL, SQS, WebSocket, Redis)
+> Tham chiếu thiết kế: Notification Platform Design (Outbox + SQS + Workers), Ví dụ Outbox Pattern.
+>
+> **Phạm vi (đã confirm với mentor):**
+> - **In-App notification** → **module bên trong PPC Tool**.
+> - **Email notification** → **service riêng (độc lập)**; PPC chỉ **phát sự kiện** sang.
 
 ---
 
-## 1. Mục tiêu & Vấn đề cần giải quyết
+## 1. TỔNG QUAN DỰ ÁN
 
-### 1.1 Vấn đề hiện tại
-- Nhiều API đọc đi đọc lại cùng một dữ liệu **ít thay đổi** nhưng query DB mỗi request 
-- Một số query nặng (JOIN nhiều bảng, COUNT, aggregate) lặp lại liên tục 
-### 1.2 Mục tiêu 
-- Xây **một lớp cache dùng chung**, type-safe (generics), dễ inject & test.
-- Chuẩn hoá **key naming**, **TTL**, **serialize JSON**, **invalidation**.
-- Pattern chủ đạo: **Cache-Aside** (lazy loading) — cache là lớp tăng tốc, **không phải nguồn sự thật**.
-- Cache **không bao giờ làm chết request**: lỗi Redis → fallback xuống DB.
+### 1.1. Mục tiêu
+- Thu thập → xử lý → phân phối thông báo dựa trên **sự kiện** trong PPC Tool, cho **2 loại**:
+  - **System / Process:** *đồng bộ Ads hoàn tất*, *lỗi đồng bộ Sellerboard*, import Plan/KDP done/failed, cron migrate...
+  - **Business:** comment mới trên SKU, OpenPO tới hạn, FBA shipment thiếu số lượng...
+- **In-App (trong PPC):** lưu DB + đẩy **realtime (WebSocket)**, có API list / mark-read / unread-count.
+- **Email (service riêng):** PPC phát event sang Email Service; service đó render template + gửi email, có retry/DLQ, delivery tracking.
+- **Không mất thông báo** (đặc biệt email — qua biên service): dùng **Outbox Pattern**.
+- **Không gửi trùng:** **Idempotency** phía consumer (at-least-once của SQS).
+
+### 1.2. Giải pháp công nghệ đề xuất
+- **PPC-BE (In-App module):** Golang + GORM + PostgreSQL; realtime qua **WebSocket** (`websocket.NotifyUser`, AWS API Gateway + Redis connection-id) — tái dùng sẵn có.
+- **Tích hợp PPC ↔ Email Service:** **Outbox Pattern** + **AWS SQS** (`email-queue`). PPC ghi outbox cùng transaction nghiệp vụ → Publisher đẩy SQS → Email Service tiêu thụ.
+- **Email Service (riêng):** Golang, DB riêng (templates + deliveries), gửi email qua **SES/SMTP**, có **Retry + DLQ**, **Idempotency**, **rate limit**, **template + Redis cache**.
+- **Observability:** Prometheus/Grafana ở cả 2 phía.
+
+> **Right-size:** tài liệu tham chiếu cho quy mô triệu user (Firebase Push, SMS, multi-tenant) — PPC nội bộ **lược bỏ** Push/SMS/multi-tenant. Giữ trụ cốt lõi: **Outbox, SQS, Idempotency, Retry/DLQ, Delivery tracking**.
 
 ---
 
-## 2. Tổng quan kiến trúc
+## 2. KIẾN TRÚC HỆ THỐNG VÀ LUỒNG HOẠT ĐỘNG
 
-Cache nằm ở **tầng Service**, xen giữa Service và Repository (Clean Architecture giữ nguyên):
+### 2.1. Sơ đồ kiến trúc tổng thể
 
 ```mermaid
-flowchart LR
-    C[Controller] --> S[Service]
-    S -->|1 . Get cache| R[(Redis)]
-    R -.->|hit: trả luôn| S
-    S -->|2 . miss → query DB| Repo[Repository]
-    Repo --> DB[(PostgreSQL)]
-    S -->|3 . Set cache + TTL| R
+flowchart TD
+    subgraph PPC[PPC Tool - PPC-BE]
+        SVC[Service nghiệp vụ<br/>import Ads, sync Sellerboard, comment...]
+        OB[(notification_outbox)]
+        INAPP[In-App module<br/>worker + store + WebSocket]
+        NDB[(notifications)]
+        PUB[Outbox Publisher<br/>SKIP LOCKED]
+        API[REST API<br/>list / mark-read / unread-count]
+        SVC -->|cùng transaction| OB
+        OB --> PUB
+        PUB -->|channel = INAPP| INAPP
+        INAPP --> NDB
+        INAPP --> WS[WebSocket realtime]
+        NDB --> API
+    end
+
+    PUB -->|channel = EMAIL| Q[(SQS: email-queue)]
+
+    subgraph EMAIL[Email Notification Service - riêng]
+        EW[Email Worker<br/>idempotent]
+        TPL[(templates + deliveries)]
+        EW --> TPL
+        EW --> SES[SES / SMTP]
+        EW -. retry .-> DLQ[(email-dlq)]
+    end
+    Q --> EW
 ```
 
-- **Repository giữ thuần** (chỉ DB, không biết tới cache) — đúng convention hiện tại.
-- **Service** quyết định cache cái gì, TTL bao lâu, khi nào invalidate.
-- Lý do đặt ở Service: nó là nơi biết "nghiệp vụ" — biết dữ liệu nào đọc nhiều, đổi ít, và khi nào write làm dữ liệu cũ.
+**Phân tầng:**
+1. **Producer (PPC service):** chỉ ghi **outbox** trong cùng transaction — không tự gửi.
+2. **Router/Publisher (PPC):** đọc outbox → định tuyến theo kênh:
+   - `INAPP` → xử lý **trong PPC** (lưu `notifications` + WebSocket).
+   - `EMAIL` → đẩy **SQS** cho **Email Service** (qua biên service).
+3. **Email Service (riêng):** consume SQS → render + gửi email → tracking + retry/DLQ.
 
----
+### 2.2. Phân chia trách nhiệm (ranh giới 2 hệ thống)
 
-## 3. Cache-Aside Pattern 
+| Hạng mục                           | PPC Tool (In-App module) | Email Service (riêng) |
+| ---------------------------------- | ------------------------ | --------------------- |
+| Phát sự kiện                       | x ghi outbox             | —                     |
+| In-App + realtime (WebSocket)      | x                        | —                     |
+| Lưu `notifications`, API mark-read | x                        | —                     |
+| Outbox + Publisher                 | x                        | —                     |
+| Nhận event email (SQS)             | —                        | x                     |
+| Template email + render            | —                        | x (DB riêng)          |
+| Gửi email (SES/SMTP)               | —                        | x                     |
+| Retry / DLQ / idempotency email    | —                        | x                     |
+| Delivery tracking email            | —                        | x                     |
 
-**Đọc (Read):**
-1. Build key → `Get` từ Redis.
-2. **Hit** → unmarshal, trả về luôn (không chạm DB).
-3. **Miss** → query DB → `Set` vào Redis kèm TTL → trả về.
+> **Hợp đồng (contract)** giữa 2 hệ thống = **message trên SQS** (mục 3.4). PPC không biết Email Service gửi thế nào; Email Service không biết PPC sinh event ra sao → **không phụ thuộc lẫn nhau**.
+
+### 2.3. Chi tiết luồng nghiệp vụ (Use Cases)
+
+**Luồng 1 — System event "Lỗi đồng bộ Sellerboard" (gửi cả In-App + Email):**
 
 ```mermaid
 sequenceDiagram
-    participant S as Service
-    participant R as Redis
-    participant DB as Database
+    participant Job as Sellerboard sync (PPC)
+    participant DB as PostgreSQL (PPC)
+    participant Pub as Outbox Publisher
+    participant InApp as In-App module
+    participant WS as WebSocket
+    participant Q as SQS email-queue
+    participant Email as Email Service
 
-    S->>R: Get(key)
-    alt Cache HIT
-        R-->>S: value
-        Note over S: trả về luôn, không chạm DB
-    else Cache MISS
-        R-->>S: nil
-        S->>DB: query
-        DB-->>S: data
-        S->>R: Set(key, data, TTL)
-        Note over S: trả về data
+    Job->>DB: BEGIN — update job status + INSERT outbox<br/>(SELLERBOARD_SYNC_FAILED, channels=[INAPP,EMAIL])
+    DB-->>Job: COMMIT (nghiệp vụ + outbox cùng sống/chết)
+    loop poll mỗi vài giây
+        Pub->>DB: SELECT PENDING ... FOR UPDATE SKIP LOCKED
+    end
+    Pub->>InApp: route channel = INAPP
+    InApp->>DB: INSERT notifications
+    InApp->>WS: push realtime (best-effort)
+    Pub->>Q: route channel = EMAIL (publish)
+    Pub->>DB: UPDATE outbox status = PUBLISHED
+    Q->>Email: consume message (self-contained)
+    Email->>Email: idempotency check (notification_id+recipient)
+    Email->>Email: render template + gửi SES
+    alt gửi lỗi
+        Email-->>Q: retry (1'→5'→...) → DLQ nếu quá ngưỡng
     end
 ```
 
-**Ghi (Write / Update / Delete):**
-1. Ghi DB (trong transaction như hiện tại).
-2. Sau khi commit thành công → **invalidate** key liên quan (`Delete` / `DeleteByPattern`).
-3. Lần đọc kế tiếp sẽ miss → tự nạp lại cache mới.
+**Luồng 2 — Business event "Comment mới" (chỉ In-App):**
 
 ```mermaid
 sequenceDiagram
-    participant S as Service
-    participant DB as Database
-    participant R as Redis
+    participant U as User (commenter)
+    participant SVC as Comment service (PPC)
+    participant DB as PostgreSQL
+    participant Pub as Outbox Publisher
+    participant InApp as In-App module
+    participant WS as WebSocket
 
-    S->>DB: BEGIN + ghi dữ liệu
-    DB-->>S: COMMIT OK
-    S->>R: Delete(key) / DeleteByPattern(pattern)
-    Note over R: key bị xoá → lần đọc sau MISS, tự nạp lại
+    U->>SVC: AddComment(SKU)
+    SVC->>DB: BEGIN — INSERT comment + INSERT outbox<br/>(COMMENT_CREATED, channels=[INAPP]) — COMMIT
+    Pub->>DB: poll outbox (SKIP LOCKED)
+    Pub->>InApp: route channel = INAPP
+    InApp->>InApp: resolve người nhận (leader/owner/viewer theo quyền)
+    InApp->>DB: INSERT notifications
+    InApp->>WS: push realtime cho user đang online
 ```
 
-> Nguyên tắc: **ghi DB trước, xoá cache sau**. Không "update cache" trực tiếp khi write (dễ lệch khi transaction rollback). Xoá để lần sau nạp lại cho chắc.
+**Luồng 3 — User xem / đánh dấu đã đọc (In-App):**
 
----
-  
-## 4. Key Naming Convention  
-  
-Kế thừa quy ước đang có (`SERVICE_ENV_MODULE_...`), chuẩn hoá thành:  
-  
-```  
-{SERVICE}:{ENV}:{MODULE}:{ENTITY}:{IDENTIFIER}  
-```  
-Ví dụ:  
-| Mục đích | Key |  
-| Detail role template id=14 | `PPC:STG:ROLE_TEMPLATE:DETAIL:14` |  
-| Danh sách store của template 14 | `PPC:STG:ROLE_TEMPLATE:STORES:14` |  
-| Permission của user 200 | `PPC:STG:USER:PERMISSION:200` |  
-  
-Quy tắc:  
-- Dùng `:` phân tách (Redis convention, hỗ trợ nhóm key khi `SCAN`/`DEL` theo prefix).  
-- `SERVICE`, `ENV` lấy từ env (`SERVICE`, `ENV`) — đã có sẵn.  
-- Có hàm `BuildKey(...)` để **không ai tự nối chuỗi tay** → tránh đụng key / sai prefix.  
-- Data **theo user** (quyền/cá nhân) dùng `BuildUserKey(userID, ...)` → key có `...:USER:{userID}:...`, tách cache riêng từng user, tránh rò rỉ data giữa các user.  
-  
----  
-  
-## 5. Các hàm Redis dùng chung
-
-Đề xuất expose qua **interface `Cache`** (inject vào service) thay vì biến global `rdb`.  
-  
-```go  
-// Cache: các method thao tác trực tiếp với Redis (inject + mock được)  
-type Cache interface {  
-Get(ctx context.Context, key string, dest any) (bool, error)    Set(ctx context.Context, key string, value any, ttl time.Duration) error    Delete(ctx context.Context, keys ...string) error    DeleteByPattern(ctx context.Context, pattern string) error    Exists(ctx context.Context, key string) (bool, error)   Expire(ctx context.Context, key string, ttl time.Duration) error    TTL(ctx context.Context, key string) (time.Duration, error)}  
-  
-// --- Hàm độc lập (không thuộc interface) ---  
-  
-// BuildKey: ghép key chuẩn theo convention SERVICE:ENV:...  
-func BuildKey(parts ...string) string  
-  
-// BuildUserKey: như BuildKey nhưng gắn userID vào key (cho data theo quyền/cá nhân)  
-func BuildUserKey(userID int, parts ...string) string  
-  
-// Remember: generic wrapper cache-aside (đặt ngoài interface vì Go chưa cho method generic)  
-func Remember[T any](ctx context.Context, c Cache, key string, ttl time.Duration, loader func() (T, error)) (T, error)  
-  
-// --- Giai đoạn sau (chưa làm ở Phase 1) ---  
-  
-// Lock: SetNX chống cache stampede  
-// func Lock(ctx context.Context, key string, ttl time.Duration) (bool, error)  
-```  
-  
-### Bảng ý nghĩa từng hàm  
-  
-| Hàm | Thuộc | Ý nghĩa | Giải quyết vấn đề gì |  
-|---|---|---|---|  
-| **`Get(ctx, key, dest) (bool, error)`** | Interface | Đọc key, unmarshal JSON vào `dest`. Trả `bool` = **hit/miss**. | Tách rõ 3 trạng thái: **hit** (có data), **miss** (`redis.Nil` → `false, nil`), **error** (Redis lỗi). Không nhầm "miss" với "lỗi" — chỗ này hay sai nhất. |  
-| **`Set(ctx, key, value, ttl)`** | Interface | Marshal `value` ra JSON rồi lưu kèm **TTL**. | Ghi object (không chỉ string) vào cache; **TTL** đảm bảo dữ liệu tự hết hạn, tránh stale vĩnh viễn nếu lỡ quên invalidate. |  
-| **`Delete(ctx, keys...)`** | Interface | Xoá 1 hoặc nhiều key cụ thể. | **Invalidation** khi update/delete entity. Variadic → xoá nhiều key liên quan trong 1 call. |  
-| **`DeleteByPattern(ctx, pattern)`** | Interface | Quét bằng `SCAN` theo prefix rồi xoá cả nhóm. | Invalidate **cả cụm** key của 1 entity khi không biết hết key con (vd xoá `PPC:STG:ROLE_TEMPLATE:*:14`). **Dùng `SCAN`, KHÔNG dùng `KEYS`** (KEYS block toàn bộ Redis). |  
-| **`Exists(ctx, key)`** | Interface | Kiểm tra key có tồn tại. | Check nhẹ không cần kéo cả value (vd kiểm tra đã cache chưa, hoặc làm cờ). |  
-| **`Expire(ctx, key, ttl)`** | Interface | Đặt/đổi lại thời gian sống của key đang tồn tại. | Sliding expiration — gia hạn key khi nó vẫn đang được dùng, tránh hết hạn giữa lúc còn nóng. |  
-| **`TTL(ctx, key)`** | Interface | Xem thời gian sống **còn lại** của key (`-1` = không có TTL, `-2` = không tồn tại). | Debug/observability cache; làm điều kiện cho `Expire` (sắp hết → gia hạn). |  
-| **`BuildKey(parts ...string) string`** | Hàm độc lập | Ghép key chuẩn theo convention (`SERVICE:ENV:...`). | Tránh mỗi nơi tự nối chuỗi → sai prefix, đụng key, khó đổi format. Một chỗ duy nhất quản key. |  
-| **`BuildUserKey(userID, parts...) string`** | Hàm độc lập | Như `BuildKey` nhưng nhúng `userID` vào key (vd `...:USER:200:...`). | Data **theo quyền/cá nhân** phải tách cache theo từng user → tránh user A thấy data của user B (rò rỉ); đồng thời chuẩn hoá vị trí `userID` trong key. |  
-| **`Remember[T](ctx, c, key, ttl, loader)`** | Hàm độc lập (generic) | Cache-aside hoàn chỉnh: hit → trả cache; miss → gọi `loader()` (query DB) → set cache → trả. | **Hàm xương sống.** Gom toàn bộ pattern get-check-set vào 1 chỗ; service chỉ cần truyền `loader` là hàm query DB. Tránh lặp 10 dòng boilerplate ở mọi API. |  
-| **`Lock(ctx, key, ttl)` (SetNX)** | Giai đoạn sau | Khoá ngắn hạn chống nhiều request cùng nạp 1 key. | Chống **cache stampede / dogpile**: khi 1 key hot hết hạn, hàng loạt request cùng miss và cùng đâm DB. |
-**Lưu ý quan trọng về `context`:** luôn truyền `ctx` của request (`c.Request.Context()`) xuống, **không** dùng `context.Background()`
+```mermaid
+flowchart LR
+    FE[Frontend] -->|GET /notifications| L[List + phân trang]
+    FE -->|GET /unread-count| B[Badge số chưa đọc]
+    FE -->|PUT /:id/read| R[is_read = true]
+    WS[WebSocket] -.->|type=notification| FE
+    L --> DB[(notifications)]
+    B --> DB
+    R --> DB
+```
 
 ---
 
-## 6. Nguyên tắc xử lý lỗi (rất quan trọng)
+## 3. KẾ HOẠCH TRIỂN KHAI VÀ THIẾT KẾ KỸ THUẬT
 
-Cache là **best-effort**, không phải nguồn sự thật:
+### 3.1. PPC-BE — Database (bổ sung)
+```sql
+-- Outbox: ghi cùng transaction nghiệp vụ (đảm bảo không mất event email)
+CREATE TABLE notification_outbox (
+  id           UUID PRIMARY KEY,
+  category     VARCHAR(20),    -- SYSTEM | BUSINESS
+  event_type   VARCHAR(100),
+  channels     VARCHAR(50),    -- "INAPP", "EMAIL", "INAPP,EMAIL"
+  aggregate_id VARCHAR(100),
+  payload      JSONB,          -- self-contained
+  status       VARCHAR(20) DEFAULT 'PENDING', -- PENDING|PUBLISHED|FAILED
+  retry_count  INT DEFAULT 0,
+  next_retry_at TIMESTAMP,
+  created_at   TIMESTAMP DEFAULT now()
+);
+CREATE INDEX idx_outbox_pending ON notification_outbox(status, next_retry_at);
 
-- `Get` lỗi Redis (không phải miss) → **log warning, coi như miss, query DB**. Không `PanicException`.
-- `Set` lỗi → **log warning, bỏ qua**. Request vẫn trả data từ DB bình thường.
-- Chỉ DB lỗi mới `PanicException` như hiện tại.
+-- In-App notifications (mở rộng từ model Notify hiện có)
+CREATE TABLE notifications (
+  id BIGSERIAL PRIMARY KEY,
+  user_id INT NOT NULL, actor_id INT,
+  category VARCHAR(20), type VARCHAR(100), level VARCHAR(20),
+  title TEXT, message TEXT,
+  entity_type VARCHAR(50), entity_id VARCHAR(100),
+  is_read BOOLEAN DEFAULT false, read_at TIMESTAMP,
+  metadata JSONB, created_at TIMESTAMP DEFAULT now()
+);
+CREATE INDEX idx_notifications_user ON notifications(user_id, is_read, created_at DESC);
+```
 
-→ Redis chết thì hệ thống **chậm đi chứ không sập**.
+### 3.2. PPC-BE — Outbox & Publisher
+- Producer ghi outbox cùng transaction (KHÔNG gọi gửi trực tiếp → tránh dual-write).
 
----
+```mermaid
+flowchart TD
+    A[Publisher poll mỗi vài giây] --> B[SELECT status=PENDING<br/>FOR UPDATE SKIP LOCKED LIMIT 100]
+    B --> C{Có record?}
+    C -->|Không| A
+    C -->|Có| D{channels chứa gì?}
+    D -->|INAPP| E[In-App handler nội bộ<br/>lưu notifications + WebSocket]
+    D -->|EMAIL| F[sqs.Publish email-queue]
+    E --> G{Thành công?}
+    F --> G
+    G -->|Có| H[UPDATE status = PUBLISHED]
+    G -->|Không| I[retry_count++ , đặt next_retry_at]
+    I --> J{retry_count > 5?}
+    J -->|Có| K[status = FAILED]
+    J -->|Không| A
+    H --> A
+```
 
-## 7. Chiến lược TTL & Invalidation
+### 3.3. PPC-BE — In-App module
+- Lưu `notifications` (resolve người nhận theo quyền) + `websocket.NotifyUser`.
+- API: `GET /notifications?page&isRead`, `GET /notifications/unread-count`, `PUT /notifications/:id/read`, `PUT /read-all`.
+- Realtime: thêm message type `notification` để FE cập nhật badge ngay.
 
-| Loại dữ liệu | TTL gợi ý | Invalidate khi |
-|---|---|---|
-| Master/cấu hình ít đổi (role template, store list, market) | 5–30 phút | Có API update/delete entity đó |
-| Dữ liệu user-scoped (permission, profile) | 1–5 phút | User đó được update quyền |
-| Kết quả query nặng/aggregate | 30s–vài phút | Theo nghiệp vụ, hoặc để TTL tự lo |
-
-Hai tầng bảo vệ stale:
-1. **Chủ động**: write xong → `Delete` key.
-2. **Bị động**: TTL hết hạn tự nạp lại (phòng khi quên invalidate ở đâu đó).
-
----
-
-## 8. Ví dụ áp dụng (minh hoạ)
-
-Cache detail role template với `Remember`:
-
-```go
-func (s *RoleTemplateServiceImpl) GetByID(c *gin.Context) {
-    // ...validate id...
-    key := redis.BuildKey("ROLE_TEMPLATE", "DETAIL", strconv.Itoa(roleTemplateID))
-
-    data, err := redis.Remember(ctx, s.cache, key, 10*time.Minute,
-        func() (dto.RoleTemplateDetailResp, error) {
-            return s.buildRoleTemplateDetail(roleTemplateID) // toàn bộ query DB hiện tại gom vào đây
-        },
-    )
-    // ...trả response...
+### 3.4. Hợp đồng tích hợp PPC ↔ Email Service (SQS message)
+**Message phải self-contained** (Email Service không query ngược PPC):
+```json
+{
+  "notification_id": "uuid",          // = outbox id, dùng cho idempotency
+  "template_code": "SELLERBOARD_SYNC_FAILED",
+  "recipients": ["a@cty.com", "ops@cty.com"],
+  "variables": { "store": "Store A", "error": "timeout", "time": "..." }
 }
 ```
+> PPC chịu trách nhiệm **resolve email người nhận** và **đưa đủ biến**; Email Service chỉ render + gửi.
 
-Invalidate khi update:
+### 3.5. Email Service (riêng) — thiết kế
+- **DB riêng:** `templates(code, channel, subject, content)`, `deliveries(notification_id, recipient, status, error)`.
+- **Idempotency:** `UNIQUE(notification_id, recipient)` — SQS at-least-once → bỏ qua nếu đã gửi.
+- **Render:** `html/template` từ `templates`, cache Redis (`template:{code}`, TTL ~30').
+- **Gửi:** SES (hoặc SMTP). **Rate limit** token-bucket (`golang.org/x/time/rate`) tránh bị provider block khi gửi lượng lớn.
+- **Retry:** 1'→5'→15'→1h→6h; quá 5 lần → **DLQ** (`email-dlq`) + dashboard resend.
+- **Monitoring:** `email_sent_total`, `email_failed_total`, `email_retry_total`.
 
-```go
-// sau khi transaction update commit thành công
-_ = s.cache.DeleteByPattern(ctx, redis.BuildKey("ROLE_TEMPLATE", "*", strconv.Itoa(roleTemplateID)))
+```mermaid
+flowchart TD
+    A[Consume message từ email-queue] --> B{Đã gửi rồi?<br/>UNIQUE notification_id+recipient}
+    B -->|Có| C[Bỏ qua - không gửi lại]
+    B -->|Chưa| D[Lấy template + render variables<br/>cache Redis]
+    D --> E[Rate limit: limiter.Wait]
+    E --> F[Gửi email SES/SMTP]
+    F --> G{Thành công?}
+    G -->|Có| H[INSERT deliveries status=SENT<br/>xoá message khỏi queue]
+    G -->|Không| I[retry tăng dần 1'→5'→15'→1h→6h]
+    I --> J{retry > 5?}
+    J -->|Có| K[Đẩy DLQ + status=FAILED<br/>dashboard resend]
+    J -->|Không| A
 ```
 
 ---
 
-## 9. Đề xuất cấu trúc file
-
-```
-app/redis/
-├── redis.go        // InitRedis (giữ), client + config
-├── cache.go        // Cache interface + impl (Get/Set/Delete/DeleteByPattern/Exists)
-├── remember.go     // Remember[T] generic
-└── key.go          // BuildKey + hằng MODULE/ENTITY
-```
-
-Inject `Cache` vào service qua `wire`/constructor như các repository hiện tại.
+## 4. PHƯƠNG ÁN HẠ TẦNG, ĐỘ TIN CẬY & GIÁM SÁT
+- **Không mất notify:** Outbox (PPC) ghi cùng transaction → email event chắc chắn được phát dù SQS publish tạm lỗi (retry).
+- **Không trùng:** Idempotency phía In-App (unique theo outbox+user+channel) và phía Email Service (unique theo notification_id+recipient).
+- **Async, không chặn nghiệp vụ:** import/cron chỉ ghi outbox rồi đi tiếp; gửi chạy nền.
+- **Fault tolerance:** Retry + DLQ (email); WebSocket offline vẫn còn bản ghi `notifications` để xem qua API.
+- **Bảo mật biên service:** message SQS không chứa secret; xác thực truy cập SQS bằng IAM; email người nhận do PPC cấp.
+- **Observability:** Prometheus 2 phía + Grafana (throughput, error rate, queue lag, retry).
 
 ---
 
-OTP 
-user gửi otp   
+## 5. ĐÁNH GIÁ ƯU - NHƯỢC ĐIỂM & RỦI RO
+
+### 5.1. Ưu điểm
+- **Tách trách nhiệm rõ:** In-App gắn PPC (cần context/quyền/realtime); Email tách riêng → **tái dùng được cho hệ thống khác** sau này, scale/deploy độc lập.
+- **Decoupled qua SQS contract:** đổi cách gửi email không ảnh hưởng PPC.
+- **Không mất / không trùng** (Outbox + Idempotency).
+- **Tận dụng hạ tầng sẵn có** (SQS, WebSocket, Redis, Prometheus).
+
+### 5.2. Rủi ro và biện pháp
+| Rủi ro | Biện pháp |
+|---|---|
+| Dual-write (mất email khi publish fail) | **Outbox** ghi cùng transaction + Publisher retry |
+| SQS at-least-once → trùng | **Idempotency** 2 phía |
+| Nhiều publisher lấy trùng record | `FOR UPDATE SKIP LOCKED` |
+| Email Service down | SQS giữ message + retry; DLQ khi quá ngưỡng |
+| Outbox phình to | Job dọn record `PUBLISHED` cũ |
+| Lẫn `Message`(progress) với `Notification` | Tách bạch vai trò |
+| Quản 2 deployable | CI/CD + monitoring riêng; contract version hoá |
+
+---
+
+## 6. KIẾN NGHỊ VÀ PHÊ DUYỆT
+
+Triển khai theo mô hình **In-App (module trong PPC) + Email Service (riêng)**, tích hợp qua **Outbox + SQS**.
+
+**Kế hoạch theo phase:**
+- **Phase 1 (PPC):** bảng `notifications` + `notification_outbox`; API list/mark-read/unread-count.
+- **Phase 2 (PPC):** Outbox Publisher (`SKIP LOCKED`) + In-App worker (DB + WebSocket); chuyển Comment/OpenPO sang pipeline.
+- **Phase 3 (PPC):** nối System events (Ads/Sellerboard/Plan sync done/failed, cron) ghi outbox; publish `email-queue`.
+- **Phase 4 (Email Service):** dựng service riêng — consume SQS, template, SES, idempotency, retry/DLQ, delivery tracking.
+- **Phase 5:** monitoring đầy đủ, rate-limit, (tuỳ) digest/aggregation.
+
+**Cần chốt tiếp:**
+- [ ] Email Service: dùng **SES** hay **SMTP** hiện có? Có DB/repo riêng do team nào quản?
+- [ ] "ops/admin" nhận system notify xác định theo **role/permission** nào?
+- [ ] Outbox Publisher chạy **goroutine trong PPC** hay **process/cron riêng**?
+- [ ] MS Teams (đang dùng cho OpenPO/shipment) — coi là 1 kênh trong scope này hay để ngoài?
+
+---
+
+> Phụ lục: Khảo sát hiện trạng (model `Notify`, WebSocket, event sources Ads/Sellerboard/Plan/cron) đã thực hiện; chi tiết theo mục 2 & 5.
