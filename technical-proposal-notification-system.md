@@ -3,9 +3,9 @@
 > Trạng thái: Draft · Áp dụng: PPC-BE (Golang, GORM, PostgreSQL, SQS, WebSocket, Redis)
 > Tham chiếu thiết kế: Notification Platform Design (Outbox + SQS + Workers), Ví dụ Outbox Pattern.
 >
-> **Phạm vi (đã confirm với mentor):**
+> **Phạm vi:**
 > - **In-App notification** → **module bên trong PPC Tool**.
-> - **Email notification** → **service riêng (độc lập)**; PPC chỉ **phát sự kiện** sang.
+> - **Email notification** → **service riêng **; PPC  **phát sự kiện** sang.
 
 ---
 
@@ -13,7 +13,7 @@
 
 ### 1.1. Mục tiêu
 - Thu thập → xử lý → phân phối thông báo dựa trên **sự kiện** trong PPC Tool, cho **2 loại**:
-  - **System / Process:** *đồng bộ Ads hoàn tất*, *lỗi đồng bộ Sellerboard*, import Plan/KDP done/failed, cron migrate...
+  - **System / Process:** *đồng bộ Ads hoàn tất*, *lỗi đồng bộ Sellerboard*, import Plan/KDP done/failed, cron job...
   - **Business:** comment mới trên SKU, OpenPO tới hạn, FBA shipment thiếu số lượng...
 - **In-App (trong PPC):** lưu DB + đẩy **realtime (WebSocket)**, có API list / mark-read / unread-count.
 - **Email (service riêng):** PPC phát event sang Email Service; service đó render template + gửi email, có retry/DLQ, delivery tracking.
@@ -21,12 +21,11 @@
 - **Không gửi trùng:** **Idempotency** phía consumer (at-least-once của SQS).
 
 ### 1.2. Giải pháp công nghệ đề xuất
-- **PPC-BE (In-App module):** Golang + GORM + PostgreSQL; realtime qua **WebSocket** (`websocket.NotifyUser`, AWS API Gateway + Redis connection-id) — tái dùng sẵn có.
+- **PPC-BE (In-App module):** Golang + GORM + PostgreSQL; realtime qua **WebSocket** (`websocket.NotifyUser`, AWS API Gateway + Redis connection-id).
 - **Tích hợp PPC ↔ Email Service:** **Outbox Pattern** + **AWS SQS** (`email-queue`). PPC ghi outbox cùng transaction nghiệp vụ → Publisher đẩy SQS → Email Service tiêu thụ.
-- **Email Service (riêng):** Golang, DB riêng (templates + deliveries), gửi email qua **SES/SMTP**, có **Retry + DLQ**, **Idempotency**, **rate limit**, **template + Redis cache**.
-- **Observability:** Prometheus/Grafana ở cả 2 phía.
+- **Email Service :**  gửi email qua **SMTP**, có **Retry + DLQ**, **Idempotency**, **rate limit**, **template + Redis cache**.
 
-> **Right-size:** tài liệu tham chiếu cho quy mô triệu user (Firebase Push, SMS, multi-tenant) — PPC nội bộ **lược bỏ** Push/SMS/multi-tenant. Giữ trụ cốt lõi: **Outbox, SQS, Idempotency, Retry/DLQ, Delivery tracking**.
+> **Right-size:** tài liệu tham chiếu cho quy mô triệu user (Firebase Push, SMS, multi-tenant) — PPC
 
 ---
 
@@ -67,28 +66,28 @@ flowchart TD
 1. **Producer (PPC service):** chỉ ghi **outbox** trong cùng transaction — không tự gửi.
 2. **Router/Publisher (PPC):** đọc outbox → định tuyến theo kênh:
    - `INAPP` → xử lý **trong PPC** (lưu `notifications` + WebSocket).
-   - `EMAIL` → đẩy **SQS** cho **Email Service** (qua biên service).
-3. **Email Service (riêng):** consume SQS → render + gửi email → tracking + retry/DLQ.
+   - `EMAIL` → đẩy **SQS** cho **Email Notification**. 
+3. **Email Service :** consume SQS → render + gửi email → tracking + retry/DLQ.
 
-### 2.2. Phân chia trách nhiệm (ranh giới 2 hệ thống)
+### 2.2. Phân chia trách nhiệm
 
-| Hạng mục                           | PPC Tool (In-App module) | Email Service (riêng) |
-| ---------------------------------- | ------------------------ | --------------------- |
-| Phát sự kiện                       | x ghi outbox             | —                     |
-| In-App + realtime (WebSocket)      | x                        | —                     |
-| Lưu `notifications`, API mark-read | x                        | —                     |
-| Outbox + Publisher                 | x                        | —                     |
-| Nhận event email (SQS)             | —                        | x                     |
-| Template email + render            | —                        | x (DB riêng)          |
-| Gửi email (SES/SMTP)               | —                        | x                     |
-| Retry / DLQ / idempotency email    | —                        | x                     |
-| Delivery tracking email            | —                        | x                     |
+| Hạng mục                           | In-app Notification | Email Notification |
+| ---------------------------------- | ------------------- | ------------------ |
+| Phát sự kiện                       | x ghi outbox        | —                  |
+| In-App + realtime (WebSocket)      | x                   | —                  |
+| Lưu `notifications`, API mark-read | x                   | —                  |
+| Outbox + Publisher                 | x                   | —                  |
+| Nhận event email (SQS)             | —                   | x                  |
+| Template email + render            | —                   | x                  |
+| Gửi email (SES/SMTP)               | —                   | x                  |
+| Retry / DLQ / idempotency email    | —                   | x                  |
+| Delivery tracking email            | —                   | x                  |
 
 > **Hợp đồng (contract)** giữa 2 hệ thống = **message trên SQS** (mục 3.4). PPC không biết Email Service gửi thế nào; Email Service không biết PPC sinh event ra sao → **không phụ thuộc lẫn nhau**.
 
 ### 2.3. Chi tiết luồng nghiệp vụ (Use Cases)
 
-**Luồng 1 — System event "Lỗi đồng bộ Sellerboard" (gửi cả In-App + Email):**
+**Luồng 1 — System event  ( In-App + Email):**
 
 ```mermaid
 sequenceDiagram
@@ -107,7 +106,7 @@ sequenceDiagram
     end
     Pub->>InApp: route channel = INAPP
     InApp->>DB: INSERT notifications
-    InApp->>WS: push realtime (best-effort)
+    InApp->>WS: push realtime
     Pub->>Q: route channel = EMAIL (publish)
     Pub->>DB: UPDATE outbox status = PUBLISHED
     Q->>Email: consume message (self-contained)
@@ -117,8 +116,43 @@ sequenceDiagram
         Email-->>Q: retry (1'→5'→...) → DLQ nếu quá ngưỡng
     end
 ```
+**1. `Job → DB: BEGIN — update job status + INSERT outbox`**  
+Job sync lỗi → mở **1 transaction** làm **2 việc cùng lúc**: cập nhật trạng thái job (failed) **và** ghi 1 event vào `notification_outbox` (`event_type=SELLERBOARD_SYNC_FAILED`, `channels=[INAPP, EMAIL]`).
 
-**Luồng 2 — Business event "Comment mới" (chỉ In-App):**
+**2. `DB → Job: COMMIT (cùng sống/chết)`**  
+Commit transaction → nghiệp vụ và event **cùng thành công hoặc cùng thất bại**. Đây là điểm cốt lõi của **Outbox**: không có chuyện "job ghi nhận lỗi nhưng event báo bị mất".
+
+**3. `loop ... Pub → DB: SELECT PENDING ... FOR UPDATE SKIP LOCKED`**  
+Publisher **chạy nền, poll mỗi vài giây**, lấy các event `PENDING`. `FOR UPDATE SKIP LOCKED` để nếu có nhiều publisher thì **không lấy trùng** record.
+
+**4. `Pub → InApp: route channel = INAPP`**  
+Event này có kênh `INAPP` → Publisher đưa cho In-App module xử lý.
+
+**5. `InApp → DB: INSERT notifications`**  
+In-App **lưu bản ghi `notifications` TRƯỚC** (đây là nguồn sự thật — để WS chết vẫn không mất).
+
+**6. `InApp → WS: push realtime`**  
+Rồi mới **đẩy WebSocket** cho user đang online (best-effort; offline thì thôi, đã có DB).
+
+**7. `Pub → Q: route channel = EMAIL (publish)`**  
+Event cũng có kênh `EMAIL` → Publisher **publish sang SQS `email-queue`** (ra khỏi PPC, sang Email Service).
+
+**8. `Pub → DB: UPDATE outbox status = PUBLISHED`**  
+Xử lý xong cả 2 kênh → đánh dấu event đã phát (`PUBLISHED`) để **không xử lý lại**.
+
+**9. `Q → Email: consume message (self-contained)`**  
+Email Service nhận message — message **tự chứa đủ** (recipients, template_code, variables) → **không cần query ngược PPC**.
+
+**10. `Email → Email: idempotency check (notification_id + recipient)`**  
+Trước khi gửi, kiểm tra đã gửi chưa (SQS có thể giao trùng) → tránh **gửi email lặp**.
+
+**11. `Email → Email: render template + gửi SES`**  
+Lấy template theo `template_code`, render với variables → gửi qua SES/SMTP → ghi `deliveries`.
+
+**12. `alt gửi lỗi: Email → Q: retry → DLQ`**  
+Nếu gửi thất bại → **retry tăng dần** (1'→5'→15'...); quá ngưỡng → đẩy **DLQ** để xử lý sau / resend.
+
+**Luồng 2 — Business event (chỉ In-App):**
 
 ```mermaid
 sequenceDiagram
@@ -137,6 +171,27 @@ sequenceDiagram
     InApp->>DB: INSERT notifications
     InApp->>WS: push realtime cho user đang online
 ```
+**1. `U → SVC: AddComment(SKU)`**  
+User gửi comment lên 1 SKU → gọi API → vào Comment service.
+
+**2. `SVC → DB: BEGIN — INSERT comment + INSERT outbox — COMMIT`**  
+Trong **1 transaction**: vừa lưu **comment**, vừa ghi **event** vào `notification_outbox` (`COMMENT_CREATED`, `channels=[INAPP]`). Commit → comment và event **cùng sống/chết** (Outbox: comment lưu được thì event chắc chắn có).  
+→ Khác Luồng 1: ở đây `channels` **chỉ `[INAPP]`** (comment không gửi email).
+
+**3. `Pub → DB: poll outbox (SKIP LOCKED)`**  
+Publisher chạy nền, lấy event `PENDING` (SKIP LOCKED để nhiều publisher không lấy trùng).
+
+**4. `Pub → InApp: route channel = INAPP`**  
+Event chỉ có kênh in-app → đưa cho In-App module. (Không có nhánh đẩy SQS email như Luồng 1.)
+
+**5. `InApp → InApp: resolve người nhận (leader/owner/viewer theo quyền)`**  
+Đây là bước **"nở 1 event ra N người nhận"** (đã giải thích ở câu trước): dựa role người comment + quyền sở hữu SKU → tính ra danh sách user cần nhận (owner SKU, leader, viewer). **Không bắn cho tất cả.**
+
+**6. `InApp → DB: INSERT notifications`**  
+Với mỗi người nhận → lưu 1 bản ghi `notifications` (nguồn sự thật, để xem qua API + WS chết vẫn còn).
+
+**7. `InApp → WS: push realtime cho user đang online`**  
+Đẩy WebSocket cho những người nhận **đang mở tool** → thấy ngay (best-effort; offline thì thôi, đã có DB).
 
 **Luồng 3 — User xem / đánh dấu đã đọc (In-App):**
 
@@ -155,7 +210,7 @@ flowchart LR
 
 ## 3. KẾ HOẠCH TRIỂN KHAI VÀ THIẾT KẾ KỸ THUẬT
 
-### 3.1. PPC-BE — Database (bổ sung)
+### 3.1. PPC-BE — Database
 ```sql
 -- Outbox: ghi cùng transaction nghiệp vụ (đảm bảo không mất event email)
 CREATE TABLE notification_outbox (
@@ -223,8 +278,36 @@ flowchart TD
 ```
 > PPC chịu trách nhiệm **resolve email người nhận** và **đưa đủ biến**; Email Service chỉ render + gửi.
 
-### 3.5. Email Service (riêng) — thiết kế
-- **DB riêng:** `templates(code, channel, subject, content)`, `deliveries(notification_id, recipient, status, error)`.
+### 3.5. Email Service — thiết kế
+- **DB:** 
+```sql 
+-- Template email (render bằng html/template, cache Redis)
+CREATE TABLE templates (
+  id         UUID PRIMARY KEY,
+  code       VARCHAR(100) NOT NULL,   -- = event_type, vd SELLERBOARD_SYNC_FAILED
+  channel    VARCHAR(20)  NOT NULL,   -- EMAIL (nếu có nhiều kênh)
+  subject    TEXT,                    --titel email có thể chứa biến {{store}}...
+  content    TEXT NOT NULL,           --body email , dùng {{variables}}
+  created_at TIMESTAMP DEFAULT now(),
+  updated_at TIMESTAMP DEFAULT now()
+);
+-- 1 code chỉ 1 template cho mỗi channel
+CREATE UNIQUE INDEX idx_templates_code_channel ON templates(code, channel);
+
+-- Delivery tracking + idempotency (chống gửi trùng)
+CREATE TABLE deliveries (
+  id              BIGSERIAL PRIMARY KEY,
+  notification_id UUID         NOT NULL,   -- = outbox id từ PPC (trace + idempotency)
+  recipient       VARCHAR(255) NOT NULL,   -- email người nhận
+  status          VARCHAR(20)  NOT NULL,   -- SENT | FAILED
+  error           TEXT,                    -- lý do lỗi (nếu FAILED)
+  retry_count     INT DEFAULT 0,
+  created_at      TIMESTAMP DEFAULT now()
+);
+-- Idempotency: 1 (notification_id, recipient) chỉ gửi 1 lần
+-- SQS at-least-once → vướng index này thì bỏ qua, không gửi lại
+CREATE UNIQUE INDEX idx_deliveries_unique ON deliveries(notification_id, recipient);
+```
 - **Idempotency:** `UNIQUE(notification_id, recipient)` — SQS at-least-once → bỏ qua nếu đã gửi.
 - **Render:** `html/template` từ `templates`, cache Redis (`template:{code}`, TTL ~30').
 - **Gửi:** SES (hoặc SMTP). **Rate limit** token-bucket (`golang.org/x/time/rate`) tránh bị provider block khi gửi lượng lớn.
@@ -237,7 +320,7 @@ flowchart TD
     B -->|Có| C[Bỏ qua - không gửi lại]
     B -->|Chưa| D[Lấy template + render variables<br/>cache Redis]
     D --> E[Rate limit: limiter.Wait]
-    E --> F[Gửi email SES/SMTP]
+    E --> F[Gửi email SMTP]
     F --> G{Thành công?}
     G -->|Có| H[INSERT deliveries status=SENT<br/>xoá message khỏi queue]
     G -->|Không| I[retry tăng dần 1'→5'→15'→1h→6h]
@@ -267,35 +350,16 @@ flowchart TD
 - **Tận dụng hạ tầng sẵn có** (SQS, WebSocket, Redis, Prometheus).
 
 ### 5.2. Rủi ro và biện pháp
-| Rủi ro | Biện pháp |
-|---|---|
-| Dual-write (mất email khi publish fail) | **Outbox** ghi cùng transaction + Publisher retry |
-| SQS at-least-once → trùng | **Idempotency** 2 phía |
-| Nhiều publisher lấy trùng record | `FOR UPDATE SKIP LOCKED` |
-| Email Service down | SQS giữ message + retry; DLQ khi quá ngưỡng |
-| Outbox phình to | Job dọn record `PUBLISHED` cũ |
-| Lẫn `Message`(progress) với `Notification` | Tách bạch vai trò |
-| Quản 2 deployable | CI/CD + monitoring riêng; contract version hoá |
+| Rủi ro                                     | Biện pháp                                         |
+| ------------------------------------------ | ------------------------------------------------- |
+| Dual-write (mất email khi publish fail)    | **Outbox** ghi cùng transaction + Publisher retry |
+| SQS at-least-once → trùng                  | **Idempotency** 2 phía                            |
+| Nhiều publisher lấy trùng record           | `FOR UPDATE SKIP LOCKED`                          |
+| Email Service down                         | SQS giữ message + retry; DLQ khi quá ngưỡng       |
+| Outbox phình to                            | Job dọn record `PUBLISHED` cũ                     |
+| Lẫn `Message`(progress) với `Notification` | Tách bạch vai trò                                 |
 
 ---
 
-## 6. KIẾN NGHỊ VÀ PHÊ DUYỆT
 
-Triển khai theo mô hình **In-App (module trong PPC) + Email Service (riêng)**, tích hợp qua **Outbox + SQS**.
 
-**Kế hoạch theo phase:**
-- **Phase 1 (PPC):** bảng `notifications` + `notification_outbox`; API list/mark-read/unread-count.
-- **Phase 2 (PPC):** Outbox Publisher (`SKIP LOCKED`) + In-App worker (DB + WebSocket); chuyển Comment/OpenPO sang pipeline.
-- **Phase 3 (PPC):** nối System events (Ads/Sellerboard/Plan sync done/failed, cron) ghi outbox; publish `email-queue`.
-- **Phase 4 (Email Service):** dựng service riêng — consume SQS, template, SES, idempotency, retry/DLQ, delivery tracking.
-- **Phase 5:** monitoring đầy đủ, rate-limit, (tuỳ) digest/aggregation.
-
-**Cần chốt tiếp:**
-- [ ] Email Service: dùng **SES** hay **SMTP** hiện có? Có DB/repo riêng do team nào quản?
-- [ ] "ops/admin" nhận system notify xác định theo **role/permission** nào?
-- [ ] Outbox Publisher chạy **goroutine trong PPC** hay **process/cron riêng**?
-- [ ] MS Teams (đang dùng cho OpenPO/shipment) — coi là 1 kênh trong scope này hay để ngoài?
-
----
-
-> Phụ lục: Khảo sát hiện trạng (model `Notify`, WebSocket, event sources Ads/Sellerboard/Plan/cron) đã thực hiện; chi tiết theo mục 2 & 5.
