@@ -337,7 +337,6 @@ flowchart TD
 - **Async, không chặn nghiệp vụ:** import/cron chỉ ghi outbox rồi đi tiếp; gửi chạy nền.
 - **Fault tolerance:** Retry + DLQ (email); WebSocket offline vẫn còn bản ghi `notifications` để xem qua API.
 - **Bảo mật biên service:** message SQS không chứa secret; xác thực truy cập SQS bằng IAM; email người nhận do PPC cấp.
-- **Observability:** Prometheus 2 phía + Grafana (throughput, error rate, queue lag, retry).
 
 ---
 
